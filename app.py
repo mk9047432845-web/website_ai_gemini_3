@@ -160,4 +160,7 @@ def chat():
     return jsonify({"reply": response, "suggestions": list(CHAT_RESPONSES.keys())})
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    # Render provides the port via the PORT environment variable
+    port = int(os.environ.get("PORT", 5000))
+    # '0.0.0.0' is required for external access
+    app.run(host="0.0.0.0", port=port)
