@@ -1,0 +1,10 @@
+flask
+flask-cors
+requests
+numpy
+Pillow
+opencv-python-headless
+tensorflow-cpu
+torch
+torchvision
+gunicorn
