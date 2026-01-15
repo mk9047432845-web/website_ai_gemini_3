@@ -1,16 +1,14 @@
 from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
-import os, requests, gc, io, tempfile
+import os, requests, gc, io
 import numpy as np
 from PIL import Image
 import cv2
-import tensorflow as tf
-import torch
-from torchvision import models, transforms
 
-# =====================
-# CONFIG & PATHS
-# =====================
+# We import these inside functions to make the app boot 10x faster
+# import tensorflow as tf
+# import torch
+
 app = Flask(__name__)
 CORS(app)
 
@@ -22,7 +20,6 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 CLASS_LABELS = ["benign", "malignant", "normal"]
 ALLOWED_EXT = {"jpg", "jpeg", "png"}
 
-# URLs for models
 HF_BASE = "https://huggingface.co/mani880740255/skin_care_tflite/resolve/main/"
 URLS = {
     "tflite": HF_BASE + "skin_model_quantized.tflite",
@@ -30,7 +27,6 @@ URLS = {
     "b3": HF_BASE + "efficientnet_b3_skin_cancer.pth"
 }
 
-# Local Paths
 PATHS = {
     "tflite": os.path.join(MODEL_DIR, "skin_model.tflite"),
     "mobilenetv2": os.path.join(MODEL_DIR, "mobilenetv2.h5"),
@@ -54,30 +50,26 @@ CHAT_RESPONSES = {
 }
 
 # =====================
-# HELPERS & CACHE MANAGER
+# HELPERS
 # =====================
 def ensure_model_exists(model_key):
-    """Checks if model exists locally; if not, downloads it once."""
     path = PATHS[model_key]
     if not os.path.exists(path):
-        print(f"Downloading {model_key} model... please wait.")
+        print(f"Downloading {model_key}...")
         r = requests.get(URLS[model_key], stream=True)
-        if r.status_code == 200:
-            with open(path, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
-        else:
-            raise Exception(f"Failed to download model from {URLS[model_key]}")
+        with open(path, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                f.write(chunk)
     return path
 
 def allowed_file(name):
     return "." in name and name.rsplit(".", 1)[1].lower() in ALLOWED_EXT
 
 # =====================
-# PREDICTION ENGINES
+# PREDICTION (LAZY LOADED)
 # =====================
-
 def predict_tflite(img_path):
+    import tensorflow as tf # Load only when needed
     model_path = ensure_model_exists("tflite")
     interpreter = tf.lite.Interpreter(model_path=model_path)
     interpreter.allocate_tensors()
@@ -91,15 +83,14 @@ def predict_tflite(img_path):
     interpreter.set_tensor(input_details[0]["index"], img)
     interpreter.invoke()
     preds = interpreter.get_tensor(interpreter.get_output_details()[0]["index"])[0]
-    
     return int(np.argmax(preds)), preds.tolist()
 
 def predict_keras(img_path):
+    import tensorflow as tf
     model_path = ensure_model_exists("mobilenetv2")
     model = tf.keras.models.load_model(model_path)
     img = Image.open(img_path).convert("RGB").resize((224, 224))
     img_arr = np.expand_dims(np.array(img)/255.0, axis=0)
-    
     preds = model.predict(img_arr)[0]
     del model
     tf.keras.backend.clear_session()
@@ -107,6 +98,8 @@ def predict_keras(img_path):
     return int(np.argmax(preds)), preds.tolist()
 
 def predict_b3(img_path):
+    import torch
+    from torchvision import models, transforms
     model_path = ensure_model_exists("b3")
     model = models.efficientnet_b3(weights=None)
     model.classifier[1] = torch.nn.Linear(1536, 3)
@@ -115,11 +108,9 @@ def predict_b3(img_path):
     
     transform = transforms.Compose([transforms.Resize((300, 300)), transforms.ToTensor()])
     img = transform(Image.open(img_path).convert("RGB")).unsqueeze(0)
-    
     with torch.no_grad():
         out = model(img)
         probs = torch.softmax(out, dim=1)[0].tolist()
-    
     del model
     gc.collect()
     return int(np.argmax(probs)), probs
@@ -127,37 +118,25 @@ def predict_b3(img_path):
 # =====================
 # ROUTES
 # =====================
-
 @app.route("/")
 def home():
     return render_template("index.html")
 
 @app.route("/predict", methods=["POST"])
 def predict():
-    if "image" not in request.files or "model" not in request.form:
-        return jsonify({"error": "image + model selection required"}), 400
-    
-    model_choice = request.form["model"]
-    file = request.files["image"]
-    
-    if not (file and allowed_file(file.filename)):
-        return jsonify({"error": "Invalid file type"}), 400
+    model_choice = request.form.get("model")
+    file = request.files.get("image")
+    if not file or not model_choice:
+        return jsonify({"error": "Missing data"}), 400
 
     path = os.path.join(UPLOAD_FOLDER, file.filename)
     file.save(path)
-    
     try:
-        if model_choice == "tflite":
-            idx, probs = predict_tflite(path)
-        elif model_choice == "mobilenetv2":
-            idx, probs = predict_keras(path)
-        elif model_choice == "b3":
-            idx, probs = predict_b3(path)
-        else:
-            return jsonify({"error": "Invalid model choice"}), 400
-
+        if model_choice == "tflite": idx, probs = predict_tflite(path)
+        elif model_choice == "mobilenetv2": idx, probs = predict_keras(path)
+        else: idx, probs = predict_b3(path)
+        
         return jsonify({
-            "model_used": model_choice,
             "prediction": CLASS_LABELS[idx],
             "confidence": float(probs[idx]),
             "probabilities": {CLASS_LABELS[i]: probs[i] for i in range(3)}
@@ -171,9 +150,10 @@ def predict():
 def chat():
     data = request.get_json()
     user_msg = data.get("message", "").lower().strip()
-    response = CHAT_RESPONSES.get(user_msg, "I only understand specific skin health questions. Try the buttons below!")
+    response = CHAT_RESPONSES.get(user_msg, "I only understand specific skin health questions.")
     return jsonify({"reply": response, "suggestions": list(CHAT_RESPONSES.keys())})
 
 if __name__ == "__main__":
+    # This block is for local testing. Render uses Gunicorn.
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
