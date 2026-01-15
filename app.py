@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
-import os, io, requests, tempfile
+import os, requests, gc, io, tempfile
 import numpy as np
 from PIL import Image
 import cv2
@@ -9,34 +9,36 @@ import torch
 from torchvision import models, transforms
 
 # =====================
-# CONFIG
+# CONFIG & PATHS
 # =====================
 app = Flask(__name__)
 CORS(app)
 
+MODEL_DIR = "models_cache"
 UPLOAD_FOLDER = "uploads"
+os.makedirs(MODEL_DIR, exist_ok=True)
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 CLASS_LABELS = ["benign", "malignant", "normal"]
 ALLOWED_EXT = {"jpg", "jpeg", "png"}
-device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# =====================
-# HUGGING FACE FILES
-# =====================
+# URLs for models
 HF_BASE = "https://huggingface.co/mani880740255/skin_care_tflite/resolve/main/"
-
-HF_MODELS = {
+URLS = {
     "tflite": HF_BASE + "skin_model_quantized.tflite",
-    "mobilenetv2": "skin_cancer_mobilenetv2%20(1).h5",
+    "mobilenetv2": HF_BASE + "skin_cancer_mobilenetv2%20(1).h5",
     "b3": HF_BASE + "efficientnet_b3_skin_cancer.pth"
 }
 
+# Local Paths
+PATHS = {
+    "tflite": os.path.join(MODEL_DIR, "skin_model.tflite"),
+    "mobilenetv2": os.path.join(MODEL_DIR, "mobilenetv2.h5"),
+    "b3": os.path.join(MODEL_DIR, "efficientnet_b3.pth")
+}
+
 # =====================
-# CHATBOT DATA
-# =====================
-# =====================
-# UPDATED CHATBOT DATA
+# FULL CHATBOT DATA
 # =====================
 CHAT_RESPONSES = {
     "what is skin care?": "Skin care is the practice of maintaining healthy, clean, and protected skin through proper hygiene and protection.",
@@ -52,79 +54,80 @@ CHAT_RESPONSES = {
 }
 
 # =====================
-# HELPERS
+# HELPERS & CACHE MANAGER
 # =====================
+def ensure_model_exists(model_key):
+    """Checks if model exists locally; if not, downloads it once."""
+    path = PATHS[model_key]
+    if not os.path.exists(path):
+        print(f"Downloading {model_key} model... please wait.")
+        r = requests.get(URLS[model_key], stream=True)
+        if r.status_code == 200:
+            with open(path, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+        else:
+            raise Exception(f"Failed to download model from {URLS[model_key]}")
+    return path
+
 def allowed_file(name):
     return "." in name and name.rsplit(".", 1)[1].lower() in ALLOWED_EXT
 
-def download_file(url):
-    r = requests.get(url)
-    if r.status_code != 200:
-        raise Exception(f"Model download failed: {url}")
-    return io.BytesIO(r.content)
+# =====================
+# PREDICTION ENGINES
+# =====================
 
-# =====================
-# MODEL PREDICTIONS
-# =====================
 def predict_tflite(img_path):
-    model_bytes = download_file(HF_MODELS["tflite"])
-    interpreter = tf.lite.Interpreter(model_content=model_bytes.read())
+    model_path = ensure_model_exists("tflite")
+    interpreter = tf.lite.Interpreter(model_path=model_path)
     interpreter.allocate_tensors()
-    input_details = interpreter.get_input_details()
-    output_details = interpreter.get_output_details()
+    
     img = cv2.imread(img_path)
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img = cv2.resize(img, (224,224))
+    img = cv2.resize(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), (224, 224))
     img = img.astype("float32") / 255.0
     img = np.expand_dims(img, axis=0)
+    
+    input_details = interpreter.get_input_details()
     interpreter.set_tensor(input_details[0]["index"], img)
     interpreter.invoke()
-    preds = interpreter.get_tensor(output_details[0]["index"])[0]
-    idx = int(np.argmax(preds))
-    return CLASS_LABELS[idx], float(preds[idx]), preds.tolist()
+    preds = interpreter.get_tensor(interpreter.get_output_details()[0]["index"])[0]
+    
+    return int(np.argmax(preds)), preds.tolist()
 
 def predict_keras(img_path):
-    model_bytes = download_file(HF_MODELS["mobilenetv2"])
-    with tempfile.NamedTemporaryFile(suffix=".h5", delete=False) as tmp:
-        tmp.write(model_bytes.read())
-        tmp_path = tmp.name
-    try:
-        model = tf.keras.models.load_model(tmp_path)
-        img = Image.open(img_path).convert("RGB")
-        img = img.resize((224,224))
-        img = np.array(img)/255.0
-        img = np.expand_dims(img, axis=0)
-        preds = model.predict(img)[0]
-        idx = int(np.argmax(preds))
-        return CLASS_LABELS[idx], float(preds[idx]), preds.tolist()
-    finally:
-        if os.path.exists(tmp_path): os.remove(tmp_path)
+    model_path = ensure_model_exists("mobilenetv2")
+    model = tf.keras.models.load_model(model_path)
+    img = Image.open(img_path).convert("RGB").resize((224, 224))
+    img_arr = np.expand_dims(np.array(img)/255.0, axis=0)
+    
+    preds = model.predict(img_arr)[0]
+    del model
+    tf.keras.backend.clear_session()
+    gc.collect()
+    return int(np.argmax(preds)), preds.tolist()
 
 def predict_b3(img_path):
-    model_bytes = download_file(HF_MODELS["b3"])
+    model_path = ensure_model_exists("b3")
     model = models.efficientnet_b3(weights=None)
     model.classifier[1] = torch.nn.Linear(1536, 3)
-    with tempfile.NamedTemporaryFile(suffix=".pth", delete=False) as tmp:
-        tmp.write(model_bytes.read())
-        tmp_path = tmp.name
-    try:
-        state_dict = torch.load(tmp_path, map_location=device)
-        model.load_state_dict(state_dict)
-        model.to(device); model.eval()
-        transform = transforms.Compose([transforms.Resize((300,300)), transforms.ToTensor()])
-        img = Image.open(img_path).convert("RGB")
-        img = transform(img).unsqueeze(0).to(device)
-        with torch.no_grad():
-            out = model(img)
-            probs = torch.softmax(out, dim=1)[0]
-        idx = int(torch.argmax(probs))
-        return CLASS_LABELS[idx], float(probs[idx]), probs.cpu().tolist()
-    finally:
-        if os.path.exists(tmp_path): os.remove(tmp_path)
+    model.load_state_dict(torch.load(model_path, map_location="cpu"))
+    model.eval()
+    
+    transform = transforms.Compose([transforms.Resize((300, 300)), transforms.ToTensor()])
+    img = transform(Image.open(img_path).convert("RGB")).unsqueeze(0)
+    
+    with torch.no_grad():
+        out = model(img)
+        probs = torch.softmax(out, dim=1)[0].tolist()
+    
+    del model
+    gc.collect()
+    return int(np.argmax(probs)), probs
 
 # =====================
 # ROUTES
 # =====================
+
 @app.route("/")
 def home():
     return render_template("index.html")
@@ -132,25 +135,37 @@ def home():
 @app.route("/predict", methods=["POST"])
 def predict():
     if "image" not in request.files or "model" not in request.form:
-        return jsonify({"error": "image + model required"}), 400
+        return jsonify({"error": "image + model selection required"}), 400
+    
     model_choice = request.form["model"]
     file = request.files["image"]
-    if model_choice not in HF_MODELS or not allowed_file(file.filename):
-        return jsonify({"error": "invalid model/file"}), 400
+    
+    if not (file and allowed_file(file.filename)):
+        return jsonify({"error": "Invalid file type"}), 400
+
     path = os.path.join(UPLOAD_FOLDER, file.filename)
     file.save(path)
+    
     try:
-        if model_choice == "tflite": pred, conf, probs = predict_tflite(path)
-        elif model_choice == "mobilenetv2": pred, conf, probs = predict_keras(path)
-        else: pred, conf, probs = predict_b3(path)
-        os.remove(path)
+        if model_choice == "tflite":
+            idx, probs = predict_tflite(path)
+        elif model_choice == "mobilenetv2":
+            idx, probs = predict_keras(path)
+        elif model_choice == "b3":
+            idx, probs = predict_b3(path)
+        else:
+            return jsonify({"error": "Invalid model choice"}), 400
+
         return jsonify({
-            "model_used": model_choice, "prediction": pred, "confidence": conf,
+            "model_used": model_choice,
+            "prediction": CLASS_LABELS[idx],
+            "confidence": float(probs[idx]),
             "probabilities": {CLASS_LABELS[i]: probs[i] for i in range(3)}
         })
     except Exception as e:
-        if os.path.exists(path): os.remove(path)
         return jsonify({"error": str(e)}), 500
+    finally:
+        if os.path.exists(path): os.remove(path)
 
 @app.route("/chat", methods=["POST"])
 def chat():
@@ -160,7 +175,5 @@ def chat():
     return jsonify({"reply": response, "suggestions": list(CHAT_RESPONSES.keys())})
 
 if __name__ == "__main__":
-    # Render provides the port via the PORT environment variable
     port = int(os.environ.get("PORT", 5000))
-    # '0.0.0.0' is required for external access
     app.run(host="0.0.0.0", port=port)
