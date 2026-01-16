@@ -9,5 +9,5 @@ numpy
 opencv-python-headless
 pillow
 tensorflow-cpu>=2.18.0
-torch>=2.5.1+cpu
-torchvision>=0.20.1+cpu
+torch==2.5.1+cpu
+torchvision==0.20.1+cpu
