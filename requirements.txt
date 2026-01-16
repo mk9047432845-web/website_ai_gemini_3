@@ -1,8 +1,13 @@
+--index-url https://pypi.org/simple
 --extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.2.2+cpu
-torchvision==0.17.2+cpu
-tensorflow-cpu
+
 flask
+flask-cors
 gunicorn
-opencv-python-headless
+requests
 numpy
+opencv-python-headless
+pillow
+tensorflow-cpu>=2.18.0
+torch>=2.5.1+cpu
+torchvision>=0.20.1+cpu
